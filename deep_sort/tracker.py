@@ -2,7 +2,7 @@
 from __future__ import absolute_import
 import numpy as np
 from . import kalman_filter
-from . import linear_assignment
+from scipy.optimize import linear_sum_assignment
 from . import iou_matching
 from .track import Track
 
@@ -96,7 +96,7 @@ class Tracker:
             features = np.array([dets[i].feature for i in detection_indices])
             targets = np.array([tracks[i].track_id for i in track_indices])
             cost_matrix = self.metric.distance(features, targets)
-            cost_matrix = linear_assignment.gate_cost_matrix(
+            cost_matrix = iou_matching.gate_cost_matrix(
                 self.kf, cost_matrix, tracks, dets, track_indices,
                 detection_indices)
 
@@ -110,7 +110,7 @@ class Tracker:
 
         # Associate confirmed tracks using appearance features.
         matches_a, unmatched_tracks_a, unmatched_detections = \
-            linear_assignment.matching_cascade(
+            self.matching_cascade(
                 gated_metric, self.metric.matching_threshold, self.max_age,
                 self.tracks, detections, confirmed_tracks)
 
@@ -122,7 +122,7 @@ class Tracker:
             k for k in unmatched_tracks_a if
             self.tracks[k].time_since_update != 1]
         matches_b, unmatched_tracks_b, unmatched_detections = \
-            linear_assignment.min_cost_matching(
+            self.min_cost_matching(
                 iou_matching.iou_cost, self.max_iou_distance, self.tracks,
                 detections, iou_track_candidates, unmatched_detections)
 
@@ -136,3 +136,103 @@ class Tracker:
             mean, covariance, self._next_id, self.n_init, self.max_age,
             detection.feature))
         self._next_id += 1
+
+    @staticmethod
+    def matching_cascade(distance_metric, max_distance, max_age, tracks, detections, track_indices):
+        """Run matching cascade.
+
+        Parameters
+        ----------
+        distance_metric : Callable
+            A function for computing the association cost between tracks and detections.
+        max_distance : float
+            Gating threshold.
+        max_age : int
+            Maximum track age.
+        tracks : List[Track]
+            List of tracks.
+        detections : List[Detection]
+            List of detections.
+        track_indices : List[int]
+            List of track indices to match.
+
+        Returns
+        -------
+        matches : List[Tuple[int, int]]
+            List of matched track and detection indices.
+        unmatched_tracks : List[int]
+            List of unmatched track indices.
+        unmatched_detections : List[int]
+            List of unmatched detection indices.
+        """
+        unmatched_tracks = track_indices
+        unmatched_detections = list(range(len(detections)))
+        matches = []
+
+        for level in range(max_age + 1):
+            if len(unmatched_detections) == 0:
+                break
+            track_indices_l = [k for k in unmatched_tracks if tracks[k].time_since_update == level]
+            if len(track_indices_l) == 0:
+                continue
+
+            cost_matrix = distance_metric(tracks, detections, track_indices_l, unmatched_detections)
+            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+
+            for row, col in zip(row_indices, col_indices):
+                if cost_matrix[row, col] > max_distance:
+                    continue
+                matches.append((track_indices_l[row], unmatched_detections[col]))
+            unmatched_tracks = [k for k in unmatched_tracks if k not in set([track_indices_l[row] for row in row_indices])]
+            unmatched_detections = [k for k in unmatched_detections if k not in set([unmatched_detections[col] for col in col_indices])]
+
+        return matches, unmatched_tracks, unmatched_detections
+
+    @staticmethod
+    def min_cost_matching(distance_metric, max_distance, tracks, detections, track_indices, detection_indices):
+        """Solve linear assignment problem.
+
+        Parameters
+        ----------
+        distance_metric : Callable
+            A function for computing the association cost between tracks and detections.
+        max_distance : float
+            Gating threshold.
+        tracks : List[Track]
+            List of tracks.
+        detections : List[Detection]
+            List of detections.
+        track_indices : List[int]
+            List of track indices to match.
+        detection_indices : List[int]
+            List of detection indices to match.
+
+        Returns
+        -------
+        matches : List[Tuple[int, int]]
+            List of matched track and detection indices.
+        unmatched_tracks : List[int]
+            List of unmatched track indices.
+        unmatched_detections : List[int]
+            List of unmatched detection indices.
+        """
+        if len(track_indices) == 0 or len(detection_indices) == 0:
+            return [], track_indices, detection_indices
+
+        cost_matrix = distance_metric(tracks, detections, track_indices, detection_indices)
+        cost_matrix[cost_matrix > max_distance] = max_distance + 1e-5
+
+        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        matches, unmatched_tracks, unmatched_detections = [], [], []
+
+        for row, col in zip(row_indices, col_indices):
+            if cost_matrix[row, col] > max_distance:
+                unmatched_tracks.append(track_indices[row])
+                unmatched_detections.append(detection_indices[col])
+            else:
+                matches.append((track_indices[row], detection_indices[col]))
+
+        unmatched_tracks.extend([track_indices[i] for i in range(len(track_indices)) if i not in row_indices])
+        unmatched_detections.extend([detection_indices[i] for i in range(len(detection_indices)) if i not in col_indices])
+
+        return matches, unmatched_tracks, unmatched_detections
